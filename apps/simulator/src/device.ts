@@ -21,8 +21,9 @@ export interface VirtualDeviceConfig {
   username: string;
   password: string;
   scenario: ScenarioFn;
-  intervalMs: number; // publish cadence, e.g. 6000ms = 10 readings/min
+  intervalMs: number;
   firmwareVersion?: string;
+  offlineAfterSeconds?: number;
 }
 
 export class VirtualDevice {
@@ -44,8 +45,6 @@ export class VirtualDevice {
         clientId: this.config.deviceId,
         clean: true,
         keepalive: 60,
-        // LWT — mirrors what real firmware would set, so a killed
-        // simulator process still marks the device offline.
         will: {
           topic: statusTopic(this.config.societyId, this.config.deviceId),
           payload: JSON.stringify({
@@ -101,11 +100,19 @@ export class VirtualDevice {
     if (!this.client?.connected) return;
 
     const elapsedSeconds = (Date.now() - this.startedAt) / 1000;
+
+    if (
+      this.config.offlineAfterSeconds !== undefined &&
+      elapsedSeconds >= this.config.offlineAfterSeconds
+    ) {
+      return;
+    }
+
     const reading = this.config.scenario(elapsedSeconds);
 
     const payload: TelemetryPayload = {
       deviceId: this.config.deviceId,
-      timestamp: Math.floor(Date.now() / 1000), // epoch SECONDS — matches contract
+      timestamp: Math.floor(Date.now() / 1000),
       sequence: this.sequence++,
       gas: { raw: reading.gasRaw, value: reading.gasValue },
       temperature: reading.temperature,
@@ -117,6 +124,15 @@ export class VirtualDevice {
       telemetryTopic(this.config.societyId, this.config.deviceId),
       JSON.stringify(payload),
       { qos: MQTT_QOS.telemetry },
+    );
+
+    this.client.publish(
+      heartbeatTopic(this.config.societyId, this.config.deviceId),
+      JSON.stringify({
+        deviceId: this.config.deviceId,
+        timestamp: Math.floor(Date.now() / 1000),
+      }),
+      { qos: MQTT_QOS.heartbeat },
     );
   }
 }
