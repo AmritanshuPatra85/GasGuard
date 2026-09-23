@@ -8,7 +8,6 @@ import type { ScenarioFn } from "../device";
 export const sensorMalfunctionScenario: ScenarioFn = (elapsedSeconds) => {
   const baseline = 400;
   const phase = Math.floor(elapsedSeconds / 15) % 3;
-  const noise = (Math.random() - 0.5) * 20;
 
   let gasValue: number;
 

@@ -19,7 +19,7 @@ export const OFFLINE_AFTER_SECONDS = 10;
  * goes offline. After OFFLINE_AFTER_SECONDS the simulator should stop
  * publishing entirely rather than calling this function.
  */
-export const offlineScenario: ScenarioFn = (elapsedSeconds) => {
+export const offlineScenario: ScenarioFn = () => {
   const baseline = 400;
   const noise = (Math.random() - 0.5) * 20;
   const gasValue = Math.max(0, baseline + noise);
