@@ -19,7 +19,10 @@ export async function markOfflineDevices(
     .select("device_id");
 
   if (error) {
-    throw error;
+    const parts = [error.message, error.code && `code=${error.code}`, error.details, error.hint]
+      .filter(Boolean)
+      .join(" | ");
+    throw new Error(`markOfflineDevices failed: ${parts}`);
   }
 
   return data?.length ?? 0;

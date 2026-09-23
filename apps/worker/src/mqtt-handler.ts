@@ -6,16 +6,31 @@ import {
   StatusPayloadSchema,
   MAX_CLOCK_SKEW_MS,
 } from "@gasguard/shared";
-import { findDeviceIdByKey, insertReading } from "./repository";
-import { updateDeviceState } from "./state";
+import type { TelemetryPayload } from "@gasguard/shared";
+import { findDeviceIdByKey, enqueueReading, startReadingWriter } from "./repository";
 import { updateDeviceHeartbeat } from "./heartbeat";
 import { incrementMetric } from "./metrics";
 
-// ── In-memory telemetry sequence tracking ────────────────────
+// ── In-memory telemetry sequence tracking ───────────────────────
 
 const lastSequenceByDevice = new Map<string, number>();
 
+function rejectSchema(
+  deviceId: string,
+  type: string,
+  issues: { path: PropertyKey[]; message: string }[],
+): void {
+  incrementMetric("schemaValidationFailed");
+  incrementMetric("rejected");
+  console.warn(
+    `[worker] Zod validation failed for ${deviceId} [${type}]:`,
+    issues.map((i) => `${i.path.map(String).join(".")}: ${i.message}`).join("; "),
+  );
+}
+
 export function registerMqttHandlers(client: MqttClient): void {
+  startReadingWriter();
+
   client.on("message", async (topic, payload) => {
     const parsed = parseTopic(topic);
     if (!parsed) {
@@ -35,22 +50,17 @@ export function registerMqttHandlers(client: MqttClient): void {
       return;
     }
 
-    // ── Zod schema validation ─────────────────────────────────
+    // ── Zod schema validation ───────────────────────────────────
     let validatedDeviceId: string;
     let validatedTimestamp: number;
     let validatedSequence: number | null = null;
-    let validatedTelemetry: import("@gasguard/shared").TelemetryPayload | null = null;
+    let validatedTelemetry: TelemetryPayload | null = null;
 
     switch (parsed.type) {
       case "telemetry": {
         const result = TelemetryPayloadSchema.safeParse(data);
         if (!result.success) {
-          incrementMetric("schemaValidationFailed");
-          incrementMetric("rejected");
-          console.warn(
-            `[worker] Zod validation failed for ${parsed.deviceId} [${parsed.type}]:`,
-            result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; "),
-          );
+          rejectSchema(parsed.deviceId, parsed.type, result.error.issues);
           return;
         }
         validatedDeviceId = result.data.deviceId;
@@ -62,12 +72,7 @@ export function registerMqttHandlers(client: MqttClient): void {
       case "heartbeat": {
         const result = HeartbeatPayloadSchema.safeParse(data);
         if (!result.success) {
-          incrementMetric("schemaValidationFailed");
-          incrementMetric("rejected");
-          console.warn(
-            `[worker] Zod validation failed for ${parsed.deviceId} [${parsed.type}]:`,
-            result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; "),
-          );
+          rejectSchema(parsed.deviceId, parsed.type, result.error.issues);
           return;
         }
         validatedDeviceId = result.data.deviceId;
@@ -77,12 +82,7 @@ export function registerMqttHandlers(client: MqttClient): void {
       case "status": {
         const result = StatusPayloadSchema.safeParse(data);
         if (!result.success) {
-          incrementMetric("schemaValidationFailed");
-          incrementMetric("rejected");
-          console.warn(
-            `[worker] Zod validation failed for ${parsed.deviceId} [${parsed.type}]:`,
-            result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; "),
-          );
+          rejectSchema(parsed.deviceId, parsed.type, result.error.issues);
           return;
         }
         validatedDeviceId = result.data.deviceId;
@@ -94,7 +94,7 @@ export function registerMqttHandlers(client: MqttClient): void {
         return;
     }
 
-    // ── Device / topic consistency ─────────────────────────────
+    // ── Device / topic consistency ──────────────────────────────
     if (validatedDeviceId !== parsed.deviceId) {
       incrementMetric("rejected");
       console.warn(
@@ -103,9 +103,8 @@ export function registerMqttHandlers(client: MqttClient): void {
       return;
     }
 
-    // ── Timestamp clock-skew validation ────────────────────────
-    const messageTimeMs = validatedTimestamp * 1000;
-    const clockSkewMs = Math.abs(Date.now() - messageTimeMs);
+    // ── Timestamp clock-skew validation ─────────────────────────
+    const clockSkewMs = Math.abs(Date.now() - validatedTimestamp * 1000);
     if (clockSkewMs > MAX_CLOCK_SKEW_MS) {
       incrementMetric("rejected");
       console.warn(
@@ -114,7 +113,7 @@ export function registerMqttHandlers(client: MqttClient): void {
       return;
     }
 
-    // ── Telemetry: sequence check + persistence ───────────────
+    // ── Telemetry: sequence check, then queue for batched insert ─
     if (parsed.type === "telemetry" && validatedSequence !== null && validatedTelemetry) {
       const sequenceKey = `${parsed.societyId}:${parsed.deviceId}`;
       const lastSequence = lastSequenceByDevice.get(sequenceKey);
@@ -123,9 +122,7 @@ export function registerMqttHandlers(client: MqttClient): void {
         if (validatedSequence === lastSequence) {
           incrementMetric("duplicate");
           incrementMetric("rejected");
-          console.warn(
-            `[worker] Duplicate sequence ${validatedSequence} for ${parsed.deviceId}, ignoring.`,
-          );
+          console.warn(`[worker] Duplicate sequence ${validatedSequence} for ${parsed.deviceId}, ignoring.`);
           return;
         }
         if (validatedSequence < lastSequence) {
@@ -137,20 +134,19 @@ export function registerMqttHandlers(client: MqttClient): void {
         }
       }
 
-      // ── PostgreSQL persistence ──────────────────────────────
       try {
         const deviceUuid = await findDeviceIdByKey(validatedTelemetry.deviceId);
 
         if (!deviceUuid) {
           incrementMetric("unknownDevice");
           incrementMetric("rejected");
-          console.warn(
-            `[worker] Unknown device key "${validatedTelemetry.deviceId}", cannot persist reading.`,
-          );
+          console.warn(`[worker] Unknown device key "${validatedTelemetry.deviceId}", cannot persist reading.`);
           return;
         }
 
-        const insertResult = await insertReading({
+        lastSequenceByDevice.set(sequenceKey, validatedSequence);
+
+        enqueueReading({
           deviceId: deviceUuid,
           recordedAt: new Date(validatedTelemetry.timestamp * 1000).toISOString(),
           sequence: validatedTelemetry.sequence,
@@ -159,38 +155,11 @@ export function registerMqttHandlers(client: MqttClient): void {
           temperature: validatedTelemetry.temperature ?? null,
           humidity: validatedTelemetry.humidity ?? null,
         });
-
-        if (insertResult === "duplicate") {
-          // Already stored (e.g. replay after a worker restart).
-          // Remember the sequence so in-memory tracking catches up with the DB.
-          lastSequenceByDevice.set(sequenceKey, validatedSequence);
-          incrementMetric("duplicate");
-          incrementMetric("rejected");
-          console.warn(
-            `[worker] Duplicate sequence ${validatedSequence} for ${parsed.deviceId} already in database, ignoring.`,
-          );
-          return;
-        }
-
-        await updateDeviceState({
-          deviceId: deviceUuid,
-          lastSeen: new Date(validatedTelemetry.timestamp * 1000).toISOString(),
-          currentGas: validatedTelemetry.gas.value,
-          health: "ok",
-        });
-
-        // Only update sequence tracking after successful persistence.
-        lastSequenceByDevice.set(sequenceKey, validatedSequence);
-        incrementMetric("accepted");
-
-        console.log(
-          `[worker] Persisted: society=${parsed.societyId} device=${parsed.deviceId} type=${parsed.type}`,
-        );
       } catch (err) {
         incrementMetric("databaseErrors");
         incrementMetric("rejected");
         console.error(
-          `[worker] Database error for ${parsed.deviceId}:`,
+          `[worker] Device lookup error for ${parsed.deviceId}:`,
           err instanceof Error ? err.message : String(err),
         );
       }
@@ -198,7 +167,7 @@ export function registerMqttHandlers(client: MqttClient): void {
       return;
     }
 
-    // ── Heartbeat: liveness persistence ───────────────────────
+    // ── Heartbeat: liveness persistence ─────────────────────────
     if (parsed.type === "heartbeat") {
       try {
         const deviceUuid = await findDeviceIdByKey(validatedDeviceId);
@@ -206,9 +175,7 @@ export function registerMqttHandlers(client: MqttClient): void {
         if (!deviceUuid) {
           incrementMetric("unknownDevice");
           incrementMetric("rejected");
-          console.warn(
-            `[worker] Unknown device key "${validatedDeviceId}", cannot persist heartbeat.`,
-          );
+          console.warn(`[worker] Unknown device key "${validatedDeviceId}", cannot persist heartbeat.`);
           return;
         }
 
@@ -218,10 +185,6 @@ export function registerMqttHandlers(client: MqttClient): void {
         });
 
         incrementMetric("accepted");
-
-        console.log(
-          `[worker] Heartbeat recorded: society=${parsed.societyId} device=${parsed.deviceId}`,
-        );
       } catch (err) {
         incrementMetric("databaseErrors");
         incrementMetric("rejected");
@@ -234,11 +197,7 @@ export function registerMqttHandlers(client: MqttClient): void {
       return;
     }
 
-    // ── Status: validation-only ───────────────────────────────
+    // ── Status: validation-only ─────────────────────────────────
     incrementMetric("accepted");
-
-    console.log(
-      `[worker] Validated: society=${parsed.societyId} device=${parsed.deviceId} type=${parsed.type}`,
-    );
   });
 }
