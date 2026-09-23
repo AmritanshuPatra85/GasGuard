@@ -150,7 +150,7 @@ export function registerMqttHandlers(client: MqttClient): void {
           return;
         }
 
-        await insertReading({
+        const insertResult = await insertReading({
           deviceId: deviceUuid,
           recordedAt: new Date(validatedTelemetry.timestamp * 1000).toISOString(),
           sequence: validatedTelemetry.sequence,
@@ -159,6 +159,18 @@ export function registerMqttHandlers(client: MqttClient): void {
           temperature: validatedTelemetry.temperature ?? null,
           humidity: validatedTelemetry.humidity ?? null,
         });
+
+        if (insertResult === "duplicate") {
+          // Already stored (e.g. replay after a worker restart).
+          // Remember the sequence so in-memory tracking catches up with the DB.
+          lastSequenceByDevice.set(sequenceKey, validatedSequence);
+          incrementMetric("duplicate");
+          incrementMetric("rejected");
+          console.warn(
+            `[worker] Duplicate sequence ${validatedSequence} for ${parsed.deviceId} already in database, ignoring.`,
+          );
+          return;
+        }
 
         await updateDeviceState({
           deviceId: deviceUuid,
