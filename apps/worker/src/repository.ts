@@ -1,7 +1,8 @@
 import { supabase } from "./db";
 import { incrementMetric } from "./metrics";
+import type { DeviceHealth } from "./state";
 
-// ── device_key -> devices.id cache ──────────────────────────────
+// -- device_key -> devices.id cache ---------------------------------------
 
 const deviceIdCache = new Map<string, string>();
 let preloadPromise: Promise<void> | null = null;
@@ -60,7 +61,7 @@ export async function findDeviceIdByKey(deviceKey: string): Promise<string | nul
   return data.id;
 }
 
-// ── Batched reading writer ──────────────────────────────────────
+// -- Batched reading writer ------------------------------------------------
 
 export interface QueuedReading {
   deviceId: string; // devices.id (UUID), not device_key
@@ -70,6 +71,7 @@ export interface QueuedReading {
   gasValue: number;
   temperature: number | null;
   humidity: number | null;
+  health: DeviceHealth; // from the detector: ok / warning / critical
 }
 
 const FLUSH_INTERVAL_MS = 1_000;
@@ -131,7 +133,7 @@ async function writeBatch(batch: QueuedReading[]): Promise<void> {
     device_id: r.deviceId,
     last_seen: r.recordedAt,
     current_gas: r.gasValue,
-    health: "ok" as const,
+    health: r.health,
     updated_at: now,
   }));
 

@@ -10,8 +10,9 @@ import type { TelemetryPayload } from "@gasguard/shared";
 import { findDeviceIdByKey, enqueueReading, startReadingWriter } from "./repository";
 import { updateDeviceHeartbeat } from "./heartbeat";
 import { incrementMetric } from "./metrics";
+import { processReading } from "./incident-engine";
 
-// ── In-memory telemetry sequence tracking ───────────────────────
+// -- In-memory telemetry sequence tracking ---------------------------------
 
 const lastSequenceByDevice = new Map<string, number>();
 
@@ -50,7 +51,7 @@ export function registerMqttHandlers(client: MqttClient): void {
       return;
     }
 
-    // ── Zod schema validation ───────────────────────────────────
+    // -- Zod schema validation ----------------------------------------------
     let validatedDeviceId: string;
     let validatedTimestamp: number;
     let validatedSequence: number | null = null;
@@ -94,7 +95,7 @@ export function registerMqttHandlers(client: MqttClient): void {
         return;
     }
 
-    // ── Device / topic consistency ──────────────────────────────
+    // -- Device / topic consistency -----------------------------------------
     if (validatedDeviceId !== parsed.deviceId) {
       incrementMetric("rejected");
       console.warn(
@@ -103,7 +104,7 @@ export function registerMqttHandlers(client: MqttClient): void {
       return;
     }
 
-    // ── Timestamp clock-skew validation ─────────────────────────
+    // -- Timestamp clock-skew validation ------------------------------------
     const clockSkewMs = Math.abs(Date.now() - validatedTimestamp * 1000);
     if (clockSkewMs > MAX_CLOCK_SKEW_MS) {
       incrementMetric("rejected");
@@ -113,7 +114,7 @@ export function registerMqttHandlers(client: MqttClient): void {
       return;
     }
 
-    // ── Telemetry: sequence check, then queue for batched insert ─
+    // -- Telemetry: sequence check, detect, then queue for batched insert ---
     if (parsed.type === "telemetry" && validatedSequence !== null && validatedTelemetry) {
       const sequenceKey = `${parsed.societyId}:${parsed.deviceId}`;
       const lastSequence = lastSequenceByDevice.get(sequenceKey);
@@ -146,6 +147,14 @@ export function registerMqttHandlers(client: MqttClient): void {
 
         lastSequenceByDevice.set(sequenceKey, validatedSequence);
 
+        // Detection: incident rows are written in the background; health goes into device_state with the reading.
+        const health = processReading({
+          deviceId: deviceUuid,
+          deviceKey: validatedTelemetry.deviceId,
+          timestampMs: validatedTelemetry.timestamp * 1000,
+          value: validatedTelemetry.gas.value,
+        });
+
         enqueueReading({
           deviceId: deviceUuid,
           recordedAt: new Date(validatedTelemetry.timestamp * 1000).toISOString(),
@@ -154,6 +163,7 @@ export function registerMqttHandlers(client: MqttClient): void {
           gasValue: validatedTelemetry.gas.value,
           temperature: validatedTelemetry.temperature ?? null,
           humidity: validatedTelemetry.humidity ?? null,
+          health,
         });
       } catch (err) {
         incrementMetric("databaseErrors");
@@ -167,7 +177,7 @@ export function registerMqttHandlers(client: MqttClient): void {
       return;
     }
 
-    // ── Heartbeat: liveness persistence ─────────────────────────
+    // -- Heartbeat: liveness persistence ------------------------------------
     if (parsed.type === "heartbeat") {
       try {
         const deviceUuid = await findDeviceIdByKey(validatedDeviceId);
@@ -197,7 +207,7 @@ export function registerMqttHandlers(client: MqttClient): void {
       return;
     }
 
-    // ── Status: validation-only ─────────────────────────────────
+    // -- Status: validation-only --------------------------------------------
     incrementMetric("accepted");
   });
 }

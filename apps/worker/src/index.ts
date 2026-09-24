@@ -2,8 +2,9 @@ import mqtt from "mqtt";
 import { MQTT_TOPIC_PREFIX } from "@gasguard/shared";
 import { registerMqttHandlers } from "./mqtt-handler";
 import { startOfflineMonitor } from "./offline-monitor";
+import { startIncidentEngine, drainIncidentWork } from "./incident-engine";
 
-// ── Environment validation ───────────────────────────────────
+// -- Environment validation ------------------------------------------------
 
 const brokerUrl = process.env.MQTT_BROKER_URL;
 const username = process.env.MQTT_USERNAME;
@@ -17,7 +18,7 @@ if (!brokerUrl || !username || !password) {
   process.exit(1);
 }
 
-// ── MQTT client ──────────────────────────────────────────────
+// -- MQTT client -----------------------------------------------------------
 
 const client = mqtt.connect(brokerUrl, {
   username,
@@ -55,22 +56,25 @@ client.on("reconnect", () => {
   console.log("[worker] Reconnecting to broker...");
 });
 
-// ── Register message handlers ────────────────────────────────
+// -- Incident engine + message handlers ------------------------------------
 
+startIncidentEngine();
 registerMqttHandlers(client);
 
-// ── Start offline monitor ────────────────────────────────────
+// -- Start offline monitor -------------------------------------------------
 
 const offlineMonitor = startOfflineMonitor();
 
-// ── Graceful shutdown ───────────────────────────────────────
+// -- Graceful shutdown -----------------------------------------------------
 
 function shutdown(signal: string) {
   console.log(`[worker] Received ${signal}, shutting down...`);
   clearInterval(offlineMonitor);
   client.end(true, () => {
     console.log("[worker] MQTT connection closed.");
-    process.exit(0);
+    // Let queued incident writes finish, but never hang on a stuck database.
+    const timeout = new Promise<void>((resolve) => setTimeout(resolve, 5_000));
+    void Promise.race([drainIncidentWork(), timeout]).finally(() => process.exit(0));
   });
 }
 
