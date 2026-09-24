@@ -1,22 +1,22 @@
 import type { ScenarioFn } from "../device";
 
 /**
- * Slow leak: gas starts near the normal baseline and rises gradually
- * over time, simulating a sustained gas accumulation in an enclosed space.
- * The ramp is smooth so that detection logic must rely on persistence
- * rather than a single spike.
+ * Slow leak: gas sits at the normal baseline for a quiet period, then rises
+ * steadily, simulating sustained gas accumulation in an enclosed space.
+ *
+ * The quiet period MUST be longer than the worker's detector warm-up
+ * (24 readings x 6 s = 144 s). If the leak starts during warm-up, the baseline
+ * never finishes learning and only the absolute thresholds can fire.
  */
+const BASELINE = 400;
+const QUIET_SECONDS = 180; // longer than the 144 s warm-up, with margin
+const RISE_PER_SECOND = 2.5; // +150 gas units per minute
+
 export const slowLeakScenario: ScenarioFn = (elapsedSeconds) => {
-  const baseline = 400;
   const noise = (Math.random() - 0.5) * 20;
 
-  // 10-second grace period where readings look essentially normal
-  const rampSeconds = Math.max(0, elapsedSeconds - 10);
-
-  // 2.5 units per second → +150 gas units per minute of sustained leak
-  const increase = rampSeconds * 2.5;
-
-  const gasValue = Math.max(0, baseline + increase + noise);
+  const rampSeconds = Math.max(0, elapsedSeconds - QUIET_SECONDS);
+  const gasValue = Math.max(0, BASELINE + rampSeconds * RISE_PER_SECOND + noise);
 
   return {
     gasRaw: Math.round(gasValue * 1.06),
